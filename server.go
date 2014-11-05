@@ -8,8 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/go.net/ipv4"
-	"github.com/hashicorp/go.net/ipv6"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -313,12 +311,12 @@ func (s *Server) handleQuery(query *dns.Msg, from net.Addr) error {
 	}
 
 	if mresp := resp(false); mresp != nil {
-		if err := s.sendResponse(mresp, from); err != nil {
+		if err := s.sendResponse(mresp, from, false); err != nil {
 			return fmt.Errorf("mdns: error sending multicast response: %v", err)
 		}
 	}
 	if uresp := resp(true); uresp != nil {
-		if err := s.sendResponse(uresp, from); err != nil {
+		if err := s.sendResponse(uresp, from, true); err != nil {
 			return fmt.Errorf("mdns: error sending unicast response: %v", err)
 		}
 	}
@@ -449,23 +447,34 @@ func (s *Server) multicastResponse(msg *dns.Msg) error {
 }
 
 // sendResponse is used to send a response packet
-func (s *Server) sendResponse(resp *dns.Msg, from net.Addr) error {
-	// TODO(reddaly): Respect the unicast argument, and allow sending responses
-	// over multicast.
+func (s *Server) sendResponse(resp *dns.Msg, from net.Addr, unicast bool) error {
 	buf, err := resp.Pack()
 	if err != nil {
 		return err
 	}
 
-	// Determine the socket to send from
+	// Determine the socket from which to send. If the request came from IPV4,
+	// only respond on IPV4.
 	addr := from.(*net.UDPAddr)
-	if addr.IP.To4() != nil {
-		_, err = s.ipv4List.WriteToUDP(buf, addr)
-		return err
-	} else {
-		_, err = s.ipv6List.WriteToUDP(buf, addr)
-		return err
+	ipv4 := addr.IP.To4() != nil
+	conn := s.ipv4List
+
+	switch ipv4 {
+	case true: // ipv4
+		if unicast == false {
+			addr = ipv4Addr
+		}
+	case false: // ipv6
+		if unicast == false {
+			addr = ipv6Addr
+		}
+		conn = s.ipv6List
+	default:
+		break
 	}
+
+	_, err = conn.WriteToUDP(buf, addr)
+	return err
 }
 
 func (s *Server) unregister() error {
