@@ -285,6 +285,8 @@ func (s *Server) sendResponse(resp *dns.Msg, from net.Addr, unicast bool) error 
 		return err
 	}
 
+	log.Printf("sending response (unicast = %v): %v", unicast, resp)
+
 	// Determine the socket to send from
 	addr := from.(*net.UDPAddr)
 	var conn *net.UDPConn

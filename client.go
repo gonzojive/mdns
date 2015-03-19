@@ -85,6 +85,16 @@ func Query(params *QueryParam) error {
 	return client.query(params)
 }
 
+// Debug starts an mDNS client and logs incoming DNS messages.
+func Debug() error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	return client.Debug()
+}
+
 // Lookup is the same as Query, however it uses all the default parameters
 func Lookup(service string, entries chan<- *ServiceEntry) error {
 	params := DefaultParams(service)
@@ -194,6 +204,21 @@ func (c *client) setInterface(iface *net.Interface) error {
 	p2 = ipv6.NewPacketConn(c.ipv6MulticastConn)
 	if err := p2.SetMulticastInterface(iface); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (c *client) Debug() error {
+	msgCh := make(chan *dns.Msg, 32)
+	go c.recv(c.ipv4UnicastConn, msgCh)
+	go c.recv(c.ipv6UnicastConn, msgCh)
+	go c.recv(c.ipv4MulticastConn, msgCh)
+	go c.recv(c.ipv6MulticastConn, msgCh)
+
+	for {
+		select {
+		case <-msgCh:
+		}
 	}
 	return nil
 }
@@ -335,6 +360,7 @@ func (c *client) recv(l *net.UDPConn, msgCh chan *dns.Msg) {
 			log.Printf("[ERR] mdns: Failed to unpack packet: %v", err)
 			continue
 		}
+		log.Printf("[INFO] mdns message: %v", msg)
 		select {
 		case msgCh <- msg:
 		case <-c.closedCh:
