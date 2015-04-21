@@ -19,6 +19,10 @@ const (
 type Zone interface {
 	// Records returns DNS records in response to a DNS question.
 	Records(q dns.Question) []dns.RR
+
+	// Announcement returns DNS records that should be broadcast during the initial
+	// availability of the service, as described in section 8.3 of RFC 6762.
+	Announcement() []dns.RR
 }
 
 // MDNSService is used to export a named service by implementing a Zone
@@ -133,13 +137,32 @@ func trimDot(s string) string {
 	return strings.Trim(s, ".")
 }
 
+// Announcement returns DNS records that should be broadcast during the initial
+// availability of the service, as described in section 8.3 of RFC 6762.
+func (m *MDNSService) Announcement() []dns.RR {
+	// Return all records.
+	// TODO(reddaly): Ensure
+	srecs := m.serviceRecords(dns.Question{Name: m.serviceAddr, Qtype: dns.TypeANY}, false)
+	irecs := m.instanceRecords(dns.Question{Name: m.instanceAddr, Qtype: dns.TypeANY})
+	// Loop through the unique resource records and set the flush bit.
+	for _, irec := range irecs {
+		// "In these unsolicited announcements, if the record is one that has been
+		// verified unique, the host sets the most significant bit of the rrclass
+		// field of the resource record.  This bit, the cache-flush bit, tells
+		// neighboring hosts that this is not a shared record type."
+		// -- RFC 6762, 10.2
+		irec.Header().Class |= 1 << 15
+	}
+	return append(srecs, irecs...)
+}
+
 // Records returns DNS records in response to a DNS question.
 func (m *MDNSService) Records(q dns.Question) []dns.RR {
 	switch q.Name {
 	case m.enumAddr:
 		return m.serviceEnum(q)
 	case m.serviceAddr:
-		return m.serviceRecords(q)
+		return m.serviceRecords(q, true)
 	case m.instanceAddr:
 		return m.instanceRecords(q)
 	case m.HostName:
@@ -173,7 +196,7 @@ func (m *MDNSService) serviceEnum(q dns.Question) []dns.RR {
 }
 
 // serviceRecords is called when the query matches the service name
-func (m *MDNSService) serviceRecords(q dns.Question) []dns.RR {
+func (m *MDNSService) serviceRecords(q dns.Question, includeInstanceRecords bool) []dns.RR {
 	switch q.Qtype {
 	case dns.TypeANY:
 		fallthrough
@@ -189,6 +212,9 @@ func (m *MDNSService) serviceRecords(q dns.Question) []dns.RR {
 			Ptr: m.instanceAddr,
 		}
 		servRec := []dns.RR{rr}
+		if !includeInstanceRecords {
+			return servRec
+		}
 
 		// Get the instance records
 		instRecs := m.instanceRecords(dns.Question{

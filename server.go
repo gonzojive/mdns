@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go.net/ipv4"
 	"github.com/hashicorp/go.net/ipv6"
@@ -99,6 +100,7 @@ func NewServer(config *Config) (*Server, error) {
 		go s.recv(s.ipv6List)
 	}
 
+	s.Announce()
 	return s, nil
 }
 
@@ -310,4 +312,88 @@ func (s *Server) sendResponse(resp *dns.Msg, from net.Addr, unicast bool) error 
 	}
 	_, err = conn.WriteToUDP(buf, addr)
 	return err
+}
+
+// Probe requests DNS records on the network that may conflict with those of
+// this service, as per section 8.1 (Probing) of RFC6762.
+func (s *Server) Probe() {
+	// TODO(reddaly): Implement me.
+}
+
+func (s *Server) announceOnce() error {
+	records := s.config.Zone.Announcement()
+	if len(records) == 0 {
+		return nil
+	}
+
+	msg := &dns.Msg{
+		MsgHdr: dns.MsgHdr{
+			// 18.1: ID (Query Identifier) - 0 for multicast
+			Id: 0,
+
+			// 18.2: QR (Query/Response) Bit - must be set to 1 in response.
+			Response: true,
+
+			// 18.3: OPCODE - must be zero in response (OpcodeQuery == 0)
+			Opcode: dns.OpcodeQuery,
+
+			// 18.4: AA (Authoritative Answer) Bit - must be set to 1
+			Authoritative: true,
+
+			// The following fields must all be set to 0:
+			// 18.5: TC (TRUNCATED) Bit
+			// 18.6: RD (Recursion Desired) Bit
+			// 18.7: RA (Recursion Available) Bit
+			// 18.8: Z (Zero) Bit
+			// 18.9: AD (Authentic Data) Bit
+			// 18.10: CD (Checking Disabled) Bit
+			// 18.11: RCODE (Response Code)
+		},
+		// 18.12 pertains to questions (handled by handleQuestion)
+		// 18.13 pertains to resource records (handled by handleQuestion)
+
+		// 18.14: Name Compression - responses should be compressed (though see
+		// caveats in the RFC), so set the Compress bit (part of the dns library
+		// API, not part of the DNS packet) to true.
+		Compress: true,
+
+		Answer: records,
+	}
+
+	buf, err := msg.Pack()
+	if err != nil {
+		return err
+	}
+
+	if s.ipv4List != nil {
+		if _, err = s.ipv4List.WriteToUDP(buf, ipv4Addr); err != nil {
+			return err
+		}
+	}
+	if s.ipv6List != nil {
+		if _, err = s.ipv6List.WriteToUDP(buf, ipv6Addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Announce broadcasts DNS records to the network that describe this service, as
+// per section 8.3 (Announcing) of RFC6762.
+func (s *Server) Announce() {
+	// The Multicast DNS responder MUST send at least two unsolicited responses,
+	// one second apart.  To provide increased robustness against packet loss, a
+	// responder MAY send up to eight unsolicited responses, provided that the
+	// interval between unsolicited responses increases by at least a factor of
+	// two with every response sent.
+
+	var timer *time.Timer
+	tryAnnounce := func() {
+		if err := s.announceOnce(); err != nil {
+			timer.Stop()
+			log.Printf("[ERR] mdns: Announce failed: %v", err)
+		}
+	}
+	timer = time.AfterFunc(time.Second*2, tryAnnounce)
+	go tryAnnounce()
 }
