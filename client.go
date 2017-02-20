@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/go.net/ipv4"
-	"github.com/hashicorp/go.net/ipv6"
 	"github.com/miekg/dns"
+	"golang.org/x/net/context"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // ServiceEntry is returned after we query for a service
@@ -22,6 +23,7 @@ type ServiceEntry struct {
 	Port       int
 	Info       string
 	InfoFields []string
+	TTL        int
 
 	Addr net.IP // @Deprecated
 
@@ -38,7 +40,8 @@ func (s *ServiceEntry) complete() bool {
 type QueryParam struct {
 	Service             string               // Service to lookup
 	Domain              string               // Lookup domain, default "local"
-	Timeout             time.Duration        // Lookup timeout, default 1 second
+	Context             context.Context      // Context
+	Timeout             time.Duration        // Lookup timeout, default 1 second. Ignored if Context is provided
 	Interface           *net.Interface       // Multicast interface to use
 	Entries             chan<- *ServiceEntry // Entries Channel
 	WantUnicastResponse bool                 // Unicast response desired, as per 5.4 in RFC
@@ -69,7 +72,7 @@ func Query(params *QueryParam) error {
 
 	// Set the multicast interface
 	if params.Interface != nil {
-		if err := client.setInterface(params.Interface); err != nil {
+		if err := client.setInterface(params.Interface, false); err != nil {
 			return err
 		}
 	}
@@ -78,12 +81,75 @@ func Query(params *QueryParam) error {
 	if params.Domain == "" {
 		params.Domain = "local"
 	}
-	if params.Timeout == 0 {
-		params.Timeout = time.Second
+
+	if params.Context == nil {
+		if params.Timeout == 0 {
+			params.Timeout = time.Second
+		}
+		params.Context, _ = context.WithTimeout(context.Background(), params.Timeout)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Run the query
 	return client.query(params)
+}
+
+// Listen listens indefinitely for multicast updates
+func Listen(entries chan<- *ServiceEntry, exit chan struct{}) error {
+	// Create a new client
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	client.setInterface(nil, true)
+
+	// Start listening for response packets
+	msgCh := make(chan *dns.Msg, 32)
+
+	go client.recv(client.ipv4MulticastConn, msgCh)
+	go client.recv(client.ipv6MulticastConn, msgCh)
+	go client.recv(client.ipv4MulticastConn, msgCh)
+	go client.recv(client.ipv6MulticastConn, msgCh)
+
+	ip := make(map[string]*ServiceEntry)
+
+	for {
+		select {
+		case <-exit:
+			return nil
+		case <-client.closedCh:
+			return nil
+		case m := <-msgCh:
+			e := messageToEntry(m, ip)
+			if e == nil {
+				continue
+			}
+
+			// Check if this entry is complete
+			if e.complete() {
+				if e.sent {
+					continue
+				}
+				e.sent = true
+				entries <- e
+				ip = make(map[string]*ServiceEntry)
+			} else {
+				// Fire off a node specific query
+				m := new(dns.Msg)
+				m.SetQuestion(e.Name, dns.TypePTR)
+				m.RecursionDesired = false
+				if err := client.sendQuery(m); err != nil {
+					log.Printf("[ERR] mdns: Failed to query instance %s: %v", e.Name, err)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // Lookup is the same as Query, however it uses all the default parameters
@@ -125,17 +191,40 @@ func newClient() (*client, error) {
 		return nil, fmt.Errorf("failed to bind to any unicast udp port")
 	}
 
-	mconn4, err := net.ListenMulticastUDP("udp4", nil, ipv4Addr)
+	mconn4, err := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
 	if err != nil {
 		log.Printf("[ERR] mdns: Failed to bind to udp4 port: %v", err)
 	}
-	mconn6, err := net.ListenMulticastUDP("udp6", nil, ipv6Addr)
+	mconn6, err := net.ListenUDP("udp6", mdnsWildcardAddrIPv6)
 	if err != nil {
 		log.Printf("[ERR] mdns: Failed to bind to udp6 port: %v", err)
 	}
 
 	if mconn4 == nil && mconn6 == nil {
 		return nil, fmt.Errorf("failed to bind to any multicast udp port")
+	}
+
+	p1 := ipv4.NewPacketConn(mconn4)
+	p2 := ipv6.NewPacketConn(mconn6)
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	var errCount1, errCount2 int
+
+	for _, iface := range ifaces {
+		if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
+			errCount1++
+		}
+		if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
+			errCount2++
+		}
+	}
+
+	if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
+		return nil, fmt.Errorf("Failed to join multicast group on all interfaces!")
 	}
 
 	c := &client{
@@ -158,7 +247,6 @@ func (c *client) Close() error {
 	}
 	c.closed = true
 
-	log.Printf("[INFO] mdns: Closing client %v", *c)
 	close(c.closedCh)
 
 	if c.ipv4UnicastConn != nil {
@@ -179,23 +267,29 @@ func (c *client) Close() error {
 
 // setInterface is used to set the query interface, uses sytem
 // default if not provided
-func (c *client) setInterface(iface *net.Interface) error {
+func (c *client) setInterface(iface *net.Interface, loopback bool) error {
 	p := ipv4.NewPacketConn(c.ipv4UnicastConn)
-	if err := p.SetMulticastInterface(iface); err != nil {
+	if err := p.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
 		return err
 	}
 	p2 := ipv6.NewPacketConn(c.ipv6UnicastConn)
-	if err := p2.SetMulticastInterface(iface); err != nil {
+	if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
 		return err
 	}
 	p = ipv4.NewPacketConn(c.ipv4MulticastConn)
-	if err := p.SetMulticastInterface(iface); err != nil {
+	if err := p.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
 		return err
 	}
 	p2 = ipv6.NewPacketConn(c.ipv6MulticastConn)
-	if err := p2.SetMulticastInterface(iface); err != nil {
+	if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
 		return err
 	}
+
+	if loopback {
+		p.SetMulticastLoopback(true)
+		p2.SetMulticastLoopback(true)
+	}
+
 	return nil
 }
 
@@ -231,51 +325,10 @@ func (c *client) query(params *QueryParam) error {
 	// Map the in-progress responses
 	inprogress := make(map[string]*ServiceEntry)
 
-	// Listen until we reach the timeout
-	finish := time.After(params.Timeout)
 	for {
 		select {
 		case resp := <-msgCh:
-			var inp *ServiceEntry
-			for _, answer := range append(resp.Answer, resp.Extra...) {
-				// TODO(reddaly): Check that response corresponds to serviceAddr?
-				switch rr := answer.(type) {
-				case *dns.PTR:
-					// Create new entry for this
-					inp = ensureName(inprogress, rr.Ptr)
-
-				case *dns.SRV:
-					// Check for a target mismatch
-					if rr.Target != rr.Hdr.Name {
-						alias(inprogress, rr.Hdr.Name, rr.Target)
-					}
-
-					// Get the port
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Host = rr.Target
-					inp.Port = int(rr.Port)
-
-				case *dns.TXT:
-					// Pull out the txt
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Info = strings.Join(rr.Txt, "|")
-					inp.InfoFields = rr.Txt
-					inp.hasTXT = true
-
-				case *dns.A:
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.A // @Deprecated
-					inp.AddrV4 = rr.A
-
-				case *dns.AAAA:
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.AAAA // @Deprecated
-					inp.AddrV6 = rr.AAAA
-				}
-			}
-
+			inp := messageToEntry(resp, inprogress)
 			if inp == nil {
 				continue
 			}
@@ -288,7 +341,8 @@ func (c *client) query(params *QueryParam) error {
 				inp.sent = true
 				select {
 				case params.Entries <- inp:
-				default:
+				case <-params.Context.Done():
+					return nil
 				}
 			} else {
 				// Fire off a node specific query
@@ -299,7 +353,7 @@ func (c *client) query(params *QueryParam) error {
 					log.Printf("[ERR] mdns: Failed to query instance %s: %v", inp.Name, err)
 				}
 			}
-		case <-finish:
+		case <-params.Context.Done():
 			return nil
 		}
 	}
@@ -326,15 +380,19 @@ func (c *client) recv(l *net.UDPConn, msgCh chan *dns.Msg) {
 		return
 	}
 	buf := make([]byte, 65536)
-	for !c.closed {
+	for {
+		c.closeLock.Lock()
+		if c.closed {
+			c.closeLock.Unlock()
+			return
+		}
+		c.closeLock.Unlock()
 		n, err := l.Read(buf)
 		if err != nil {
-			log.Printf("[ERR] mdns: Failed to read packet: %v", err)
 			continue
 		}
 		msg := new(dns.Msg)
 		if err := msg.Unpack(buf[:n]); err != nil {
-			log.Printf("[ERR] mdns: Failed to unpack packet: %v", err)
 			continue
 		}
 		select {
@@ -361,4 +419,64 @@ func ensureName(inprogress map[string]*ServiceEntry, name string) *ServiceEntry 
 func alias(inprogress map[string]*ServiceEntry, src, dst string) {
 	srcEntry := ensureName(inprogress, src)
 	inprogress[dst] = srcEntry
+}
+
+func messageToEntry(m *dns.Msg, inprogress map[string]*ServiceEntry) *ServiceEntry {
+	var inp *ServiceEntry
+
+	for _, answer := range append(m.Answer, m.Extra...) {
+		// TODO(reddaly): Check that response corresponds to serviceAddr?
+		switch rr := answer.(type) {
+		case *dns.PTR:
+			// Create new entry for this
+			inp = ensureName(inprogress, rr.Ptr)
+			if inp.complete() {
+				continue
+			}
+		case *dns.SRV:
+			// Check for a target mismatch
+			if rr.Target != rr.Hdr.Name {
+				alias(inprogress, rr.Hdr.Name, rr.Target)
+			}
+
+			// Get the port
+			inp = ensureName(inprogress, rr.Hdr.Name)
+			if inp.complete() {
+				continue
+			}
+			inp.Host = rr.Target
+			inp.Port = int(rr.Port)
+		case *dns.TXT:
+			// Pull out the txt
+			inp = ensureName(inprogress, rr.Hdr.Name)
+			if inp.complete() {
+				continue
+			}
+			inp.Info = strings.Join(rr.Txt, "|")
+			inp.InfoFields = rr.Txt
+			inp.hasTXT = true
+		case *dns.A:
+			// Pull out the IP
+			inp = ensureName(inprogress, rr.Hdr.Name)
+			if inp.complete() {
+				continue
+			}
+			inp.Addr = rr.A // @Deprecated
+			inp.AddrV4 = rr.A
+		case *dns.AAAA:
+			// Pull out the IP
+			inp = ensureName(inprogress, rr.Hdr.Name)
+			if inp.complete() {
+				continue
+			}
+			inp.Addr = rr.AAAA // @Deprecated
+			inp.AddrV6 = rr.AAAA
+		}
+
+		if inp != nil {
+			inp.TTL = int(answer.Header().Ttl)
+		}
+	}
+
+	return inp
 }
