@@ -47,6 +47,12 @@ type Config struct {
 	// interface. If not provided, the system default multicase interface
 	// is used.
 	Iface *net.Interface
+
+	// Whether to set the IP_MULTICAST_LOOP socket option on the multicast sockets
+	// opened.  Setting this to true allows mDNS clients on the same machine to
+	// discover the service. See
+	// http://stackoverflow.com/questions/1719156/is-there-a-way-to-test-multicast-ip-on-same-box
+	DisableMulticastLoopback bool
 }
 
 // mDNS server is used to listen for mDNS queries and respond if we
@@ -67,8 +73,11 @@ type Server struct {
 func NewServer(config *Config) (*Server, error) {
 	// Create the listeners
 	// Create wildcard connections (because :5353 can be already taken by other apps)
+	// TODO(reddaly): Handle errors returned by ListenMulticastUDP
 	ipv4List, _ := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
 	ipv6List, _ := net.ListenUDP("udp6", mdnsWildcardAddrIPv6)
+
+	// Check if we have any listener
 	if ipv4List == nil && ipv6List == nil {
 		return nil, fmt.Errorf("[ERR] mdns: Failed to bind to any udp port!")
 	}
@@ -76,8 +85,12 @@ func NewServer(config *Config) (*Server, error) {
 	// Join multicast groups to receive announcements
 	p1 := ipv4.NewPacketConn(ipv4List)
 	p2 := ipv6.NewPacketConn(ipv6List)
-	p1.SetMulticastLoopback(true)
-	p2.SetMulticastLoopback(true)
+	if err := p1.SetMulticastLoopback(!config.DisableMulticastLoopback); err != nil {
+		return nil, err
+	}
+	if err := p2.SetMulticastLoopback(!config.DisableMulticastLoopback); err != nil {
+		return nil, err
+	}
 
 	if config.Iface != nil {
 		if err := p1.JoinGroup(config.Iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
