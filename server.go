@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go.net/ipv4"
+	"github.com/hashicorp/go.net/ipv6"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -76,6 +78,19 @@ func NewServer(config *Config) (*Server, error) {
 	// TODO(reddaly): Handle errors returned by ListenMulticastUDP
 	ipv4List, _ := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
 	ipv6List, _ := net.ListenUDP("udp6", mdnsWildcardAddrIPv6)
+
+	{
+		p := ipv4.NewPacketConn(ipv4List)
+		if err := p.SetMulticastLoopback(!config.DisableMulticastLoopback); err != nil {
+			return nil, err
+		}
+	}
+	{
+		p := ipv6.NewPacketConn(ipv6List)
+		if err := p.SetMulticastLoopback(!config.DisableMulticastLoopback); err != nil {
+			return nil, err
+		}
+	}
 
 	{
 		p := ipv4.NewPacketConn(ipv4List)
